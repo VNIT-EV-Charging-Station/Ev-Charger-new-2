@@ -81,12 +81,12 @@ esp_err_t pt1000_max31865_init(void)
         .queue_size = 1,
     };
 
-    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    esp_err_t ret = spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    ret = spi_bus_add_device(SPI2_HOST, &devcfg, &s_pt1000_spi);
+    ret = spi_bus_add_device(SPI3_HOST, &devcfg, &s_pt1000_spi);
     if (ret != ESP_OK) {
         return ret;
     }

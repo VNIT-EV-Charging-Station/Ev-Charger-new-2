@@ -16,5 +16,5 @@
     "--compile-commands-dir=d:\\AC_EVSEev_charger\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM7"
+  "idf.portWin": "COM8"
 }

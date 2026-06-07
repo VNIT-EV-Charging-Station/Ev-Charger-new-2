@@ -1,7 +1,6 @@
 #include "nrf24_sender.h"
 
-#include <stdbool.h>
-#include <stdint.h>
+#include <math.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -12,18 +11,24 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define NRF_CE_PIN GPIO_NUM_42
-#define NRF_CSN_PIN GPIO_NUM_45
-#define NRF_SCK_PIN GPIO_NUM_39
-#define NRF_MOSI_PIN GPIO_NUM_40
-#define NRF_MISO_PIN GPIO_NUM_41
+#define NRF_CE_GPIO 42
+#define NRF_CSN_GPIO 45
+#define NRF_SCK_GPIO 39
+#define NRF_MOSI_GPIO 40
+#define NRF_MISO_GPIO 41
 
-#define NRF_SPI_HOST SPI3_HOST
-#define NRF_SPI_CLOCK_HZ (1000 * 1000)
+#define NRF_CHANNEL 76
+#define NRF_PAYLOAD_LEN 32
+#define NRF_SPI_CLOCK_HZ (500 * 1000)
+#define NRF_RF_SETUP_250KBPS_REDUCED_PA 0x22
+#define NRF_SETUP_RETR_DISABLED 0x00
+#define TOTAL_CHARGER_PACKETS 13
 
-#define NRF_RF_CHANNEL 76
-#define NRF_RF_SETUP_250KBPS_LOW_POWER 0x26
-#define NRF_SETUP_RETR_4000US_15_RETRY 0xFF
+#define CMD_R_REGISTER 0x00
+#define CMD_W_REGISTER 0x20
+#define CMD_W_TX_PAYLOAD 0xA0
+#define CMD_FLUSH_TX 0xE1
+#define CMD_NOP 0xFF
 
 #define REG_CONFIG 0x00
 #define REG_EN_AA 0x01
@@ -39,272 +44,239 @@
 #define REG_DYNPD 0x1C
 #define REG_FEATURE 0x1D
 
-#define CMD_W_REGISTER 0x20
-#define CMD_ACTIVATE 0x50
-#define CMD_W_TX_PAYLOAD 0xA0
-#define CMD_FLUSH_TX 0xE1
-#define CMD_FLUSH_RX 0xE2
-#define CMD_NOP 0xFF
+#define STATUS_RX_DR BIT(6)
+#define STATUS_TX_DS BIT(5)
+#define STATUS_MAX_RT BIT(4)
+#define PACKET_TYPE_CHARGER 0x21
 
-#define CONFIG_EN_CRC (1U << 3)
-#define CONFIG_CRCO (1U << 2)
-#define CONFIG_PWR_UP (1U << 1)
+typedef struct __attribute__((packed)) {
+    uint8_t type;
+    uint8_t flags;
+    uint16_t sequence;
+    int16_t pt1000_temp_x100;
+    int16_t sht30_temp_x100;
+    uint16_t sht30_humidity_x100;
+    uint16_t mic_hz_x10;
+    int16_t current_ma;
+    int16_t current_raw_ma;
+    int32_t power_est_x100;
+    uint16_t current_adc_mv;
+    uint16_t current_bias_mv;
+    uint16_t current_adc_rms_uv;
+    uint16_t current_signal_rms_uv;
+    int16_t p_loss_x100;
+    int16_t pred_temp_x100;
+} charger_packet_t;
 
-#define STATUS_RX_DR (1U << 6)
-#define STATUS_TX_DS (1U << 5)
-#define STATUS_MAX_RT (1U << 4)
-#define STATUS_CLEAR_MASK (STATUS_RX_DR | STATUS_TX_DS | STATUS_MAX_RT)
+_Static_assert(sizeof(charger_packet_t) == NRF_PAYLOAD_LEN, "charger packet must be exactly one NRF24 payload");
 
-#define TX_TIMEOUT_MS 250
-
-static const char *TAG = "NRF24_TX";
-static const uint8_t pipe_addr[5] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};
-
-static spi_device_handle_t s_nrf;
-static bool s_initialized;
+static const char *TAG = "NRF24_CHARGER_TX";
+static const uint8_t BESS_ADDR[5] = {'B', 'E', 'S', 'S', '1'};
+static spi_device_handle_t s_spi;
 static uint16_t s_sequence;
 
-static void ce(bool level)
+static esp_err_t nrf_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
 {
-    gpio_set_level(NRF_CE_PIN, level ? 1 : 0);
-}
-
-static esp_err_t transfer(const uint8_t *tx, uint8_t *rx, size_t len)
-{
-    spi_transaction_t transaction = {
+    spi_transaction_t t = {
         .length = len * 8,
         .tx_buffer = tx,
         .rx_buffer = rx,
     };
-    return spi_device_polling_transmit(s_nrf, &transaction);
+    return spi_device_transmit(s_spi, &t);
 }
 
-static esp_err_t command(uint8_t cmd)
+static uint8_t nrf_read_reg(uint8_t reg)
 {
-    uint8_t tx[1] = {cmd};
-    uint8_t rx[1] = {0};
-    return transfer(tx, rx, sizeof(tx));
-}
-
-static esp_err_t write_reg(uint8_t reg, uint8_t value)
-{
-    uint8_t tx[2] = {(uint8_t)(CMD_W_REGISTER | (reg & 0x1F)), value};
+    uint8_t tx[2] = {CMD_R_REGISTER | (reg & 0x1F), CMD_NOP};
     uint8_t rx[2] = {0};
-    return transfer(tx, rx, sizeof(tx));
+    (void)nrf_transfer(tx, rx, sizeof(tx));
+    return rx[1];
 }
 
-static esp_err_t write_reg_bytes(uint8_t reg, const uint8_t *data, size_t len)
+static void nrf_write_reg(uint8_t reg, uint8_t value)
 {
-    uint8_t tx[6] = {0};
-    uint8_t rx[6] = {0};
+    uint8_t tx[2] = {CMD_W_REGISTER | (reg & 0x1F), value};
+    (void)nrf_transfer(tx, NULL, sizeof(tx));
+}
 
+static void nrf_write_buf(uint8_t reg, const uint8_t *data, size_t len)
+{
+    uint8_t tx[1 + 5] = {0};
     tx[0] = CMD_W_REGISTER | (reg & 0x1F);
     memcpy(&tx[1], data, len);
-    return transfer(tx, rx, len + 1);
+    (void)nrf_transfer(tx, NULL, len + 1);
 }
 
-static esp_err_t read_status(uint8_t *status)
+static void nrf_command(uint8_t cmd)
 {
-    uint8_t tx[1] = {CMD_NOP};
-    uint8_t rx[1] = {0};
-
-    ESP_RETURN_ON_ERROR(transfer(tx, rx, sizeof(tx)), TAG, "status read failed");
-    *status = rx[0];
-    return ESP_OK;
+    uint8_t tx = cmd;
+    (void)nrf_transfer(&tx, NULL, 1);
 }
 
-static esp_err_t clear_status(void)
+static esp_err_t send_payload(const void *payload, size_t len)
 {
-    return write_reg(REG_STATUS, STATUS_CLEAR_MASK);
-}
+    uint8_t tx[1 + NRF_PAYLOAD_LEN] = {CMD_W_TX_PAYLOAD};
+    memcpy(&tx[1], payload, len);
 
-static esp_err_t activate_features(void)
-{
-    uint8_t tx[2] = {CMD_ACTIVATE, 0x73};
-    uint8_t rx[2] = {0};
-    return transfer(tx, rx, sizeof(tx));
-}
+    nrf_write_reg(REG_STATUS, STATUS_RX_DR | STATUS_TX_DS | STATUS_MAX_RT);
+    nrf_command(CMD_FLUSH_TX);
+    ESP_RETURN_ON_ERROR(nrf_transfer(tx, NULL, sizeof(tx)), TAG, "payload write failed");
 
-static uint16_t clamp_u16(float value)
-{
-    if (value <= 0.0f) {
-        return 0;
+    gpio_set_level(NRF_CE_GPIO, 1);
+    esp_rom_delay_us(20);
+    gpio_set_level(NRF_CE_GPIO, 0);
+
+    for (int i = 0; i < 120; i++) {
+        uint8_t status = nrf_read_reg(REG_STATUS);
+        if ((status & STATUS_TX_DS) != 0) {
+            nrf_write_reg(REG_STATUS, STATUS_TX_DS);
+            return ESP_OK;
+        }
+        if ((status & STATUS_MAX_RT) != 0) {
+            nrf_write_reg(REG_STATUS, STATUS_MAX_RT);
+            nrf_command(CMD_FLUSH_TX);
+            return ESP_FAIL;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
-    if (value >= 65535.0f) {
-        return 65535;
-    }
-    return (uint16_t)(value + 0.5f);
-}
 
-static uint32_t clamp_u32(float value)
-{
-    if (value <= 0.0f) {
-        return 0;
-    }
-    if (value >= 4294967295.0f) {
-        return 4294967295U;
-    }
-    return (uint32_t)(value + 0.5f);
+    nrf_command(CMD_FLUSH_TX);
+    return ESP_ERR_TIMEOUT;
 }
 
 static int16_t clamp_i16(float value)
 {
-    if (value <= -32768.0f) {
-        return -32768;
-    }
-    if (value >= 32767.0f) {
+    if (value > 32767.0f) {
         return 32767;
     }
-    return (int16_t)(value >= 0.0f ? value + 0.5f : value - 0.5f);
+    if (value < -32768.0f) {
+        return -32768;
+    }
+    return (int16_t)lroundf(value);
 }
 
-static esp_err_t write_tx_payload(const nrf24_charger_packet_t *packet)
+static uint16_t clamp_u16(float value)
 {
-    uint8_t tx[1 + NRF_PAYLOAD_SIZE] = {0};
-    uint8_t rx[1 + NRF_PAYLOAD_SIZE] = {0};
+    if (value > 65535.0f) {
+        return 65535;
+    }
+    if (value < 0.0f) {
+        return 0;
+    }
+    return (uint16_t)lroundf(value);
+}
 
-    tx[0] = CMD_W_TX_PAYLOAD;
-    memcpy(&tx[1], packet, sizeof(*packet));
-    return transfer(tx, rx, sizeof(tx));
+static int32_t clamp_i32(float value)
+{
+    if (value > 2147483647.0f) {
+        return 2147483647;
+    }
+    if (value < -2147483648.0f) {
+        return (int32_t)-2147483647 - 1;
+    }
+    return (int32_t)lroundf(value);
 }
 
 esp_err_t nrf24_sender_init(void)
 {
-    if (s_initialized) {
-        return ESP_OK;
-    }
-
-    gpio_config_t ce_config = {
-        .pin_bit_mask = 1ULL << NRF_CE_PIN,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&ce_config), TAG, "CE config failed");
-    ce(false);
-
-    spi_bus_config_t bus_config = {
-        .mosi_io_num = NRF_MOSI_PIN,
-        .miso_io_num = NRF_MISO_PIN,
-        .sclk_io_num = NRF_SCK_PIN,
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = NRF_MOSI_GPIO,
+        .miso_io_num = NRF_MISO_GPIO,
+        .sclk_io_num = NRF_SCK_GPIO,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 1 + NRF_PAYLOAD_SIZE,
     };
-    ESP_RETURN_ON_ERROR(spi_bus_initialize(NRF_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO), TAG, "SPI bus failed");
-
-    spi_device_interface_config_t dev_config = {
+    spi_device_interface_config_t devcfg = {
         .clock_speed_hz = NRF_SPI_CLOCK_HZ,
         .mode = 0,
-        .spics_io_num = NRF_CSN_PIN,
+        .spics_io_num = NRF_CSN_GPIO,
         .queue_size = 1,
     };
-    ESP_RETURN_ON_ERROR(spi_bus_add_device(NRF_SPI_HOST, &dev_config, &s_nrf), TAG, "SPI device failed");
 
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_DISABLED);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        return ret;
+    }
+    ESP_RETURN_ON_ERROR(spi_bus_add_device(SPI2_HOST, &devcfg, &s_spi), TAG, "add device failed");
+
+    gpio_config_t ce_cfg = {
+        .pin_bit_mask = 1ULL << NRF_CE_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&ce_cfg));
+    gpio_set_level(NRF_CE_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_RETURN_ON_ERROR(command(CMD_FLUSH_TX), TAG, "flush tx failed");
-    ESP_RETURN_ON_ERROR(command(CMD_FLUSH_RX), TAG, "flush rx failed");
-    ESP_RETURN_ON_ERROR(clear_status(), TAG, "clear status failed");
-
-    ESP_RETURN_ON_ERROR(write_reg(REG_CONFIG, CONFIG_EN_CRC | CONFIG_CRCO | CONFIG_PWR_UP), TAG, "config failed");
-    ESP_RETURN_ON_ERROR(write_reg(REG_EN_AA, 0x01), TAG, "ack failed");
-    ESP_RETURN_ON_ERROR(write_reg(REG_EN_RXADDR, 0x01), TAG, "rxaddr failed");
-    ESP_RETURN_ON_ERROR(write_reg(REG_SETUP_AW, 0x03), TAG, "addr width failed");
-    ESP_RETURN_ON_ERROR(write_reg(REG_SETUP_RETR, NRF_SETUP_RETR_4000US_15_RETRY), TAG, "retry failed");
-    ESP_RETURN_ON_ERROR(write_reg(REG_RF_CH, NRF_RF_CHANNEL), TAG, "channel failed");
-    ESP_RETURN_ON_ERROR(write_reg(REG_RF_SETUP, NRF_RF_SETUP_250KBPS_LOW_POWER), TAG, "rf setup failed");
-    ESP_ERROR_CHECK_WITHOUT_ABORT(activate_features());
-    ESP_RETURN_ON_ERROR(write_reg(REG_DYNPD, 0x01), TAG, "dynpd failed");
-    ESP_RETURN_ON_ERROR(write_reg(REG_FEATURE, 0x04), TAG, "feature failed");
-    ESP_RETURN_ON_ERROR(write_reg_bytes(REG_TX_ADDR, pipe_addr, sizeof(pipe_addr)), TAG, "tx addr failed");
-    ESP_RETURN_ON_ERROR(write_reg_bytes(REG_RX_ADDR_P0, pipe_addr, sizeof(pipe_addr)), TAG, "rx p0 addr failed");
-
+    nrf_write_reg(REG_CONFIG, 0x0C);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    nrf_write_reg(REG_EN_AA, 0x00);
+    nrf_write_reg(REG_EN_RXADDR, 0x01);
+    nrf_write_reg(REG_SETUP_AW, 0x03);
+    nrf_write_reg(REG_SETUP_RETR, NRF_SETUP_RETR_DISABLED);
+    nrf_write_reg(REG_RF_CH, NRF_CHANNEL);
+    nrf_write_reg(REG_RF_SETUP, NRF_RF_SETUP_250KBPS_REDUCED_PA);
+    nrf_write_buf(REG_TX_ADDR, BESS_ADDR, sizeof(BESS_ADDR));
+    nrf_write_buf(REG_RX_ADDR_P0, BESS_ADDR, sizeof(BESS_ADDR));
+    nrf_write_reg(REG_RX_PW_P0, NRF_PAYLOAD_LEN);
+    nrf_write_reg(REG_EN_AA, 0x00);
+    nrf_write_reg(REG_FEATURE, 0x00);
+    nrf_write_reg(REG_DYNPD, 0x00);
+    nrf_write_reg(REG_STATUS, STATUS_RX_DR | STATUS_TX_DS | STATUS_MAX_RT);
+    nrf_command(CMD_FLUSH_TX);
+    nrf_write_reg(REG_CONFIG, 0x0E);
     vTaskDelay(pdMS_TO_TICKS(5));
 
-    s_initialized = true;
-    ESP_LOGI(TAG, "NRF24 sender ready: one 32-byte packet, CH76, RF_SETUP 0x26, SPI=1MHz, DPL");
+    uint8_t config = nrf_read_reg(REG_CONFIG);
+    uint8_t channel = nrf_read_reg(REG_RF_CH);
+    uint8_t rf_setup = nrf_read_reg(REG_RF_SETUP);
+    if (config == 0x00 || config == 0xFF || (config & 0x0E) != 0x0E ||
+        channel != NRF_CHANNEL || rf_setup != NRF_RF_SETUP_250KBPS_REDUCED_PA) {
+        ESP_LOGE(TAG, "NRF24 bad readback CONFIG=0x%02X CH=%u RF=0x%02X",
+                 config, channel, rf_setup);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "TX channel %u, 250kbps, shared address, no ACK, SPI=%uHz",
+             NRF_CHANNEL, NRF_SPI_CLOCK_HZ);
     return ESP_OK;
 }
 
-esp_err_t nrf24_sender_send_charger_data(float pt1000_temp,
-                                         float sht30_temp,
-                                         float sht30_humidity,
-                                         float mic_hz,
-                                         float current,
-                                         float current_raw,
-                                         float power_est,
-                                         float current_adc,
-                                         float current_bias,
-                                         float current_adc_rms,
-                                         float current_signal_rms,
-                                         float p_loss,
-                                         float pred_temp,
+esp_err_t nrf24_sender_send_charger_data(float pt1000_temperature_c,
+                                         float sht30_temperature_c,
+                                         float sht30_humidity_percent,
+                                         float mic_frequency_hz,
+                                         float current_rms_a,
+                                         float current_raw_a,
+                                         float current_power_w,
+                                         float current_adc_voltage_v,
+                                         float current_bias_voltage_v,
+                                         float current_adc_rms_voltage_v,
+                                         float current_signal_rms_voltage_v,
+                                         float p_loss_w,
+                                         float thermal_temperature_c,
                                          uint8_t flags)
 {
-    if (!s_initialized) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    nrf24_charger_packet_t packet = {
-        .type = NRF24_PACKET_TYPE_CHARGER,
+    charger_packet_t packet = {
+        .type = PACKET_TYPE_CHARGER,
         .flags = flags,
-        .sequence = s_sequence++,
-        .pt1000_temp_x100 = clamp_i16(pt1000_temp * 100.0f),
-        .sht30_temp_x100 = clamp_i16(sht30_temp * 100.0f),
-        .sht30_humidity_x100 = clamp_u16(sht30_humidity * 100.0f),
-        .mic_hz_x10 = clamp_u16(mic_hz * 10.0f),
-        .current_ma = clamp_u16(current * 1000.0f),
-        .current_raw_ma = clamp_u16(current_raw * 1000.0f),
-        .power_est_x100 = clamp_u32(power_est * 100.0f),
-        .current_adc_mv = clamp_u16(current_adc * 1000.0f),
-        .current_bias_mv = clamp_u16(current_bias * 1000.0f),
-        .current_adc_rms_uv = clamp_u16(current_adc_rms * 1000000.0f),
-        .current_signal_rms_uv = clamp_u16(current_signal_rms * 1000000.0f),
-        .p_loss_x100 = clamp_u16(p_loss * 100.0f),
-        .pred_temp_x100 = clamp_i16(pred_temp * 100.0f),
+        .sequence = ++s_sequence,
+        .pt1000_temp_x100 = clamp_i16(pt1000_temperature_c * 100.0f),
+        .sht30_temp_x100 = clamp_i16(sht30_temperature_c * 100.0f),
+        .sht30_humidity_x100 = clamp_u16(sht30_humidity_percent * 100.0f),
+        .mic_hz_x10 = clamp_u16(mic_frequency_hz * 10.0f),
+        .current_ma = clamp_i16(current_rms_a * 1000.0f),
+        .current_raw_ma = clamp_i16(current_raw_a * 1000.0f),
+        .power_est_x100 = clamp_i32(current_power_w * 100.0f),
+        .current_adc_mv = clamp_u16(current_adc_voltage_v * 1000.0f),
+        .current_bias_mv = clamp_u16(current_bias_voltage_v * 1000.0f),
+        .current_adc_rms_uv = clamp_u16(current_adc_rms_voltage_v * 1000000.0f),
+        .current_signal_rms_uv = clamp_u16(current_signal_rms_voltage_v * 1000000.0f),
+        .p_loss_x100 = clamp_i16(p_loss_w * 100.0f),
+        .pred_temp_x100 = clamp_i16(thermal_temperature_c * 100.0f),
     };
 
-    ESP_RETURN_ON_ERROR(command(CMD_FLUSH_TX), TAG, "flush tx failed");
-    ESP_RETURN_ON_ERROR(clear_status(), TAG, "clear status failed");
-    ESP_RETURN_ON_ERROR(write_tx_payload(&packet), TAG, "payload write failed");
-
-    ce(true);
-    esp_rom_delay_us(20);
-    ce(false);
-
-    for (int i = 0; i < TX_TIMEOUT_MS; i++) {
-        uint8_t status = 0;
-        ESP_RETURN_ON_ERROR(read_status(&status), TAG, "status read failed");
-
-        if (status & STATUS_TX_DS) {
-            clear_status();
-            ESP_LOGI(TAG,
-                     "TX seq=%u PT=%.2f SHT=%.2f H=%.2f Mic=%.1fHz I=%.3fA P=%.2fW Ploss=%.2f Pred=%.2f",
-                     packet.sequence,
-                     packet.pt1000_temp_x100 / 100.0f,
-                     packet.sht30_temp_x100 / 100.0f,
-                     packet.sht30_humidity_x100 / 100.0f,
-                     packet.mic_hz_x10 / 10.0f,
-                     packet.current_ma / 1000.0f,
-                     packet.power_est_x100 / 100.0f,
-                     packet.p_loss_x100 / 100.0f,
-                     packet.pred_temp_x100 / 100.0f);
-            return ESP_OK;
-        }
-
-        if (status & STATUS_MAX_RT) {
-            clear_status();
-            command(CMD_FLUSH_TX);
-            ESP_LOGW(TAG, "TX failed MAX_RT seq=%u", packet.sequence);
-            return ESP_FAIL;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
-    command(CMD_FLUSH_TX);
-    ESP_LOGW(TAG, "TX timeout seq=%u", packet.sequence);
-    return ESP_ERR_TIMEOUT;
+    esp_err_t ret = send_payload(&packet, sizeof(packet));
+    vTaskDelay(pdMS_TO_TICKS(35));
+    esp_err_t ret_repeat = send_payload(&packet, sizeof(packet));
+    return ret == ESP_OK ? ret_repeat : ret;
 }

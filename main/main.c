@@ -127,6 +127,8 @@ void app_main(void)
 
             if (send_ret != ESP_OK) {
                 printf("NRF24 send set failed: %s\n", esp_err_to_name(send_ret));
+            } else {
+                printf("NRF24 charger packet TX OK\n");
             }
         }
 
