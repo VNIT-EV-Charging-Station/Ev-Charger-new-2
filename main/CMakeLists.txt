@@ -4,7 +4,7 @@ idf_component_register(
         "main.c"
         "current_sensor_sct013.c"
         "inmp441_fft.c"
-        "nrf24_sender.c"
+        "lora_sender.c"
         "pt1000_max31865.c"
         "sensor_telemetry.c"
         "sht30_sensor.c"
